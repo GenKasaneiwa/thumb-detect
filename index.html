@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Thumb Detect</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --fg: #1d1d1b; --muted: #8a877f; --card: #fff; --line: #e4e1da;
+    --r: #e0603a; --l: #2f7bd8; --b: #3a9a5b; --s: #9a8f3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --fg: #ecebe6; --muted: #8a877f; --card: #1f1f1d; --line: #2e2d2a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.6 -apple-system, "Hiragino Sans", system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
+    padding: calc(env(safe-area-inset-top) + 10px) 16px 10px; }
+  #verdict { font-size: 32px; font-weight: 700; letter-spacing: .02em; transition: color .2s; }
+  #sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .gauge { position: relative; height: 8px; border-radius: 4px; margin-top: 8px;
+    background: linear-gradient(90deg, var(--l), var(--line) 45%, var(--line) 55%, var(--r)); }
+  .gauge i { position: absolute; top: -4px; width: 4px; height: 16px; border-radius: 2px; background: var(--fg);
+    left: 50%; transform: translateX(-50%); transition: left .25s; }
+  .gauge-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+  #log { display: flex; gap: 4px; margin-top: 6px; min-height: 20px; }
+  #log span { font-size: 11px; font-weight: 700; color: #fff; border-radius: 4px; padding: 0 5px; }
+  .R { background: var(--r); } .L { background: var(--l); } .B { background: var(--b); } .S { background: var(--s); }
+  main { padding: 16px; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin: 10px 0; }
+  .card b { display: block; }
+  .card small { color: var(--muted); }
+  #pad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+  #pad button { aspect-ratio: 1; border: 1px solid var(--line); border-radius: 10px; background: var(--card);
+    color: var(--fg); font-size: 18px; touch-action: manipulation; }
+  #pad button:active { background: var(--line); }
+  button.reset { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 8px; padding: 6px 12px; }
+  canvas { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+</style>
+</head>
+<body>
+<header>
+  <div id="verdict">判定中…</div>
+  <div class="gauge"><i id="needle"></i></div>
+  <div class="gauge-labels"><span>左親指</span><span>右親指</span></div>
+  <div id="log"></div>
+  <div id="sub">縦にスクロールしてください</div>
+</header>
+<canvas id="cv"></canvas>
+<main>
+  <p class="hint">普段どおりに縦スクロールすると、指の軌跡の弧から右親指か左親指かを推定します。
+    両手の判定には、下のパッドを両手の親指で交互に連打してください。許可は要りません（タッチイベントだけで判定します）。</p>
+  <button class="reset" id="reset">リセット</button>
+  <div id="pad"></div>
+  <div id="list"></div>
+</main>
+<script>
+// ---- 判定パラメータ ----
+const WINDOW = 10;          // 直近いくつのイベントで判定するか
+const SWIPE_MIN_DY = 80;    // 縦スワイプとみなす最小の縦移動(px)
+const VOTE_TH = 0.025;      // これ未満のスコアは「直線」
+const ALT_TAP_MS = 280;     // 左右交互タップを両手とみなす間隔
+
+const events = [];          // {k:'R'|'L'|'B'|'S', s:number}
+const strokes = new Map();  // identifier -> points
+let lastTap = null;
+let multiSeen = false;
+let drawn = [];             // 描画用の直近ストローク
+
+// ダミーのリスト
+const list = document.getElementById('list');
+for (let i = 1; i <= 80; i++) {
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = `<b>アイテム ${i}</b><small>スクロールして親指の軌跡を集めます</small>`;
+  list.appendChild(d);
+}
+const pad = document.getElementById('pad');
+for (let i = 0; i < 8; i++) {
+  const b = document.createElement('button');
+  b.textContent = '●';
+  pad.appendChild(b);
+}
+
+function push(k, s = 0) {
+  events.push({ k, s });
+  if (events.length > WINDOW) events.shift();
+  render();
+}
+
+// 縦スワイプ1本からスコアを出す。正 → 右親指、負 → 左親指
+function analyzeSwipe(pts) {
+  const p0 = pts[0], pn = pts[pts.length - 1];
+  const dy = pn.y - p0.y, dx = pn.x - p0.x;
+  if (Math.abs(dy) < SWIPE_MIN_DY || Math.abs(dy) < Math.abs(dx) * 1.5 || pts.length < 5) return null;
+  // 弦（始点→終点）からの x 方向の膨らみ。中間 20〜80% の点だけ使う
+  let sum = 0, n = 0;
+  for (const p of pts) {
+    const t = (p.y - p0.y) / dy;
+    if (t < 0.2 || t > 0.8) continue;
+    sum += p.x - (p0.x + t * dx);
+    n++;
+  }
+  if (!n) return null;
+  const bulge = sum / n / Math.abs(dy);          // 左に膨らむ(負) → 右親指
+  // 上スワイプで右へ流れる / 下スワイプで左へ流れる → 右親指
+  const drift = (dx / Math.abs(dy)) * (dy < 0 ? 1 : -1);
+  return { score: -bulge + 0.3 * drift, bulge, drift };
+}
+
+function verdict() {
+  const c = { R: 0, L: 0, B: 0, S: 0 };
+  for (const e of events) c[e.k]++;
+  const n = events.length;
+  if (n < 3) return { text: '判定中…', color: 'var(--muted)' };
+  if (c.B >= 2) return { text: '両手', color: 'var(--b)' };
+  if (c.R >= n * 0.6) return { text: '右親指', color: 'var(--r)' };
+  if (c.L >= n * 0.6) return { text: '左親指', color: 'var(--l)' };
+  if (c.S >= n * 0.5) return { text: '両手 / 人差し指？', color: 'var(--s)' };
+  return { text: c.R > c.L ? '右親指？' : c.L > c.R ? '左親指？' : '不明', color: 'var(--muted)' };
+}
+
+function render() {
+  const v = verdict();
+  const el = document.getElementById('verdict');
+  el.textContent = v.text;
+  el.style.color = v.color;
+  const sw = events.filter(e => e.k !== 'B');
+  const mean = sw.length ? sw.reduce((a, e) => a + e.s, 0) / sw.length : 0;
+  const pos = Math.max(0, Math.min(1, 0.5 + mean * 5));
+  document.getElementById('needle').style.left = (pos * 100) + '%';
+  document.getElementById('log').innerHTML = events.map(e => `<span class="${e.k}">${e.k}</span>`).join('');
+}
+
+function sub(t) { document.getElementById('sub').textContent = t; }
+
+addEventListener('touchstart', e => {
+  if (e.touches.length >= 2 && !multiSeen) {
+    multiSeen = true;
+    push('B');
+    sub('同時に2点タッチ → 両手');
+  }
+  for (const t of e.changedTouches) {
+    strokes.set(t.identifier, { pts: [{ x: t.clientX, y: t.clientY }], t0: performance.now(), touch: t });
+  }
+}, { passive: true });
+
+addEventListener('touchmove', e => {
+  for (const t of e.changedTouches) {
+    const s = strokes.get(t.identifier);
+    if (s) s.pts.push({ x: t.clientX, y: t.clientY });
+  }
+}, { passive: true });
+
+function end(e) {
+  if (e.touches.length === 0) multiSeen = false;
+  for (const t of e.changedTouches) {
+    const s = strokes.get(t.identifier);
+    strokes.delete(t.identifier);
+    if (!s) continue;
+    s.pts.push({ x: t.clientX, y: t.clientY });
+    const p0 = s.pts[0], pn = s.pts[s.pts.length - 1];
+    const dist = Math.hypot(pn.x - p0.x, pn.y - p0.y);
+    const dur = performance.now() - s.t0;
+
+    // Android などで取れれば楕円情報も表示
+    const extra = s.touch.rotationAngle ? ` / 楕円 ${Math.round(s.touch.rotationAngle)}°` : '';
+
+    if (dist < 15 && dur < 350) {
+      // タップ：左右の半分を短い間隔で交互に押していれば両手
+      const side = pn.x < innerWidth / 2 ? 'L' : 'R';
+      const now = performance.now();
+      if (lastTap && lastTap.side !== side && now - lastTap.t < ALT_TAP_MS) {
+        push('B');
+        sub(`左右交互タップ ${Math.round(now - lastTap.t)}ms → 両手`);
+      }
+      lastTap = { side, t: now };
+      continue;
+    }
+    const r = analyzeSwipe(s.pts);
+    if (!r) continue;
+    const k = r.score > VOTE_TH ? 'R' : r.score < -VOTE_TH ? 'L' : 'S';
+    push(k, r.score);
+    sub(`score ${r.score.toFixed(3)}（膨らみ ${r.bulge.toFixed(3)}, 流れ ${r.drift.toFixed(3)}）${extra}`);
+    drawn.push({ pts: s.pts, k, born: performance.now() });
+  }
+}
+addEventListener('touchend', end, { passive: true });
+addEventListener('touchcancel', end, { passive: true });
+
+document.getElementById('reset').addEventListener('click', () => {
+  events.length = 0; drawn = []; lastTap = null; render(); sub('リセットしました');
+});
+
+// 軌跡の描画（2秒でフェード）
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize); resize();
+const colors = { R: '#e0603a', L: '#2f7bd8', S: '#9a8f3a' };
+(function loop() {
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  const now = performance.now();
+  drawn = drawn.filter(d => now - d.born < 2000);
+  for (const d of drawn) {
+    ctx.globalAlpha = 1 - (now - d.born) / 2000;
+    ctx.strokeStyle = colors[d.k]; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath();
+    d.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.stroke();
+    // 弦
+    const a = d.pts[0], b = d.pts[d.pts.length - 1];
+    ctx.setLineDash([4, 6]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.globalAlpha = 1;
+  requestAnimationFrame(loop);
+})();
+render();
+</script>
+</body>
+</html>
