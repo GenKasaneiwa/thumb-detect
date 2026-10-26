@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Thumb Detect</title>
+<title>Grip Detect</title>
 <style>
   :root {
     --bg: #f6f5f2; --fg: #1d1d1b; --muted: #8a877f; --card: #fff; --line: #e4e1da;
-    --r: #e0603a; --l: #2f7bd8; --b: #3a9a5b; --s: #9a8f3a;
+    --R: #e0603a; --L: #2f7bd8; --B: #3a9a5b; --IR: #b0478f; --IL: #7a5bc9;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #141413; --fg: #ecebe6; --muted: #8a877f; --card: #1f1f1d; --line: #2e2d2a; }
@@ -17,16 +17,15 @@
     font: 15px/1.6 -apple-system, "Hiragino Sans", system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
   header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
     padding: calc(env(safe-area-inset-top) + 10px) 16px 10px; }
-  #verdict { font-size: 32px; font-weight: 700; letter-spacing: .02em; transition: color .2s; }
+  #verdict { font-size: 26px; font-weight: 700; letter-spacing: .02em; transition: color .2s; }
   #sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .gauge { position: relative; height: 8px; border-radius: 4px; margin-top: 8px;
-    background: linear-gradient(90deg, var(--l), var(--line) 45%, var(--line) 55%, var(--r)); }
-  .gauge i { position: absolute; top: -4px; width: 4px; height: 16px; border-radius: 2px; background: var(--fg);
-    left: 50%; transform: translateX(-50%); transition: left .25s; }
-  .gauge-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
-  #log { display: flex; gap: 4px; margin-top: 6px; min-height: 20px; }
+  #bars { display: grid; grid-template-columns: auto 1fr 3em; gap: 2px 8px; align-items: center; margin-top: 6px; font-size: 12px; }
+  #bars .track { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  #bars .track i { display: block; height: 100%; border-radius: 4px; transition: width .25s; }
+  #bars .pct { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #log { display: flex; gap: 4px; margin-top: 6px; min-height: 20px; flex-wrap: wrap; }
   #log span { font-size: 11px; font-weight: 700; color: #fff; border-radius: 4px; padding: 0 5px; }
-  .R { background: var(--r); } .L { background: var(--l); } .B { background: var(--b); } .S { background: var(--s); }
+  #log span.tap { opacity: .55; }
   main { padding: 16px; }
   .hint { color: var(--muted); font-size: 13px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin: 10px 0; }
@@ -43,38 +42,124 @@
 <body>
 <header>
   <div id="verdict">判定中…</div>
-  <div class="gauge"><i id="needle"></i></div>
-  <div class="gauge-labels"><span>左親指</span><span>右親指</span></div>
+  <div id="bars"></div>
   <div id="log"></div>
-  <div id="sub">縦にスクロールしてください</div>
+  <div id="sub">縦にスクロールしたり、あちこちタップしてください</div>
 </header>
 <canvas id="cv"></canvas>
 <main>
-  <p class="hint">普段どおりに縦スクロールすると、指の軌跡の弧から右親指か左親指かを推定します。
-    両手の判定には、下のパッドを両手の親指で交互に連打してください。許可は要りません（タッチイベントだけで判定します）。</p>
+  <p class="hint">普段どおりに縦スクロールやタップをすると、持ち方を推定します。
+    親指は付け根を中心に回るので軌跡が弧になり、人差し指は腕ごと動くのでほぼまっすぐになります。
+    両手持ちは、下のパッドを左右の親指で交互に連打すると早く判定できます。許可は要りません（タッチイベントだけで判定します）。</p>
   <button class="reset" id="reset">リセット</button>
   <div id="pad"></div>
   <div id="list"></div>
 </main>
 <script>
-// ---- 判定パラメータ ----
-const WINDOW = 10;          // 直近いくつのイベントで判定するか
+// ---- classifier ----（DOM に触らない判定ロジック）
+const GRIPS = {
+  R:  { name: '右手持ち・右親指', short: '右親' },
+  L:  { name: '左手持ち・左親指', short: '左親' },
+  B:  { name: '両手持ち・両親指', short: '両親' },
+  IR: { name: '右手の人差し指',   short: '右人' },
+  IL: { name: '左手の人差し指',   short: '左人' },
+};
+const KEYS = Object.keys(GRIPS);
+const WINDOW = 14;          // 直近いくつの証拠で判定するか
 const SWIPE_MIN_DY = 80;    // 縦スワイプとみなす最小の縦移動(px)
-const VOTE_TH = 0.025;      // これ未満のスコアは「直線」
+const ARC_LO = 0.02;        // これ以下の曲がり具合は「まっすぐ」
+const ARC_HI = 0.06;        // これ以上は「はっきり弧」
 const ALT_TAP_MS = 280;     // 左右交互タップを両手とみなす間隔
 
-const events = [];          // {k:'R'|'L'|'B'|'S', s:number}
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+// 縦スワイプ1本からスコアを出す。正 → 右手寄り、負 → 左手寄り
+function analyzeSwipe(pts) {
+  const p0 = pts[0], pn = pts[pts.length - 1];
+  const dy = pn.y - p0.y, dx = pn.x - p0.x;
+  if (Math.abs(dy) < SWIPE_MIN_DY || Math.abs(dy) < Math.abs(dx) * 1.5 || pts.length < 5) return null;
+  // 弦（始点→終点）からの x 方向の膨らみ。中間 20〜80% の点だけ使う
+  let sum = 0, n = 0, sx = 0;
+  for (const p of pts) {
+    sx += p.x;
+    const t = (p.y - p0.y) / dy;
+    if (t < 0.2 || t > 0.8) continue;
+    sum += p.x - (p0.x + t * dx);
+    n++;
+  }
+  if (!n) return null;
+  const bulge = sum / n / Math.abs(dy);          // 左に膨らむ(負) → 右手
+  // 上スワイプで右へ流れる / 下スワイプで左へ流れる → 右手
+  const drift = (dx / Math.abs(dy)) * (dy < 0 ? 1 : -1);
+  return { score: -bulge + 0.3 * drift, bulge, drift, meanX: sx / pts.length, len: Math.abs(dy) };
+}
+
+// スワイプ1本 → 各持ち方の対数尤度
+function swipeLL(r, W, H) {
+  const s = r.score, c = Math.abs(s);
+  const arc = clamp01((c - ARC_LO) / (ARC_HI - ARC_LO));   // 0: まっすぐ … 1: はっきり弧
+  const right = s > 0;
+  // 人差し指でも肘を中心にわずかに弧を描くので、弱い符号だけ左右の手がかりにする
+  const lean = Math.max(-1, Math.min(1, s / ARC_LO));
+  const ll = {
+    R:  right ? 1.2 * arc : -1.5 * arc,
+    L:  right ? -1.5 * arc : 1.2 * arc,
+    // 両親指：右半分の右向きの弧・左半分の左向きの弧は自然、逆は不自然
+    B:  (right === (r.meanX > W / 2)) ? 1.0 * arc : -1.2 * arc,
+    IR: (1 - arc) * (0.8 + 0.4 * lean) - 1.2 * arc,
+    IL: (1 - arc) * (0.8 - 0.4 * lean) - 1.2 * arc,
+  };
+  // 画面の半分を超える長いストロークは親指だと届きにくい
+  if (r.len / H > 0.5) { ll.IR += 0.4; ll.IL += 0.4; ll.R -= 0.2; ll.L -= 0.2; }
+  return ll;
+}
+
+// タップ1回 → 各持ち方の対数尤度（届きやすさ）
+function tapLL(x, y, W, H) {
+  const diag = Math.hypot(W, H);
+  const pen = (d, lim) => d > lim ? -(d - lim) * 6 : 0;
+  // 片手持ちの親指は下の隅が付け根。両手持ちは左右の中ほどが付け根
+  const dR = Math.hypot(W - x, H - y) / diag, dL = Math.hypot(x, H - y) / diag;
+  const dB = Math.min(Math.hypot(W - x, H * 0.65 - y), Math.hypot(x, H * 0.65 - y)) / diag;
+  return { R: pen(dR, 0.7), L: pen(dL, 0.7), B: pen(dB, 0.6), IR: 0, IL: 0 };
+}
+
+// 左右交互の速いタップ・同時タッチ → 両親指
+const ALT_LL   = { R: -1.2, L: -1.2, B: 2.5, IR: -0.6, IL: -0.6 };
+const MULTI_LL = { R: -1.0, L: -1.0, B: 2.0, IR: -0.3, IL: -0.3 };
+
+function argmax(ll) { return KEYS.reduce((a, k) => ll[k] > ll[a] ? k : a, KEYS[0]); }
+
+function posterior(evs) {
+  const sum = Object.fromEntries(KEYS.map(k => [k, 0]));
+  for (const e of evs) for (const k of KEYS) sum[k] += e.ll[k];
+  const m = Math.max(...KEYS.map(k => sum[k]));
+  const ex = KEYS.map(k => Math.exp(sum[k] - m)), z = ex.reduce((a, b) => a + b, 0);
+  return Object.fromEntries(KEYS.map((k, i) => [k, ex[i] / z]));
+}
+
+function verdict(evs) {
+  const strong = evs.filter(e => !e.tap).length;
+  if (strong < 3) return { text: '判定中…', color: 'var(--muted)' };
+  const p = posterior(evs), k = argmax(p);
+  if (p[k] >= 0.6) return { text: GRIPS[k].name, color: `var(--${k})`, k };
+  if (p[k] >= 0.35) return { text: GRIPS[k].name + '？', color: `var(--${k})`, k };
+  return { text: '不明', color: 'var(--muted)' };
+}
+// ---- /classifier ----
+
+const events = [];          // {ll, tap}
 const strokes = new Map();  // identifier -> points
 let lastTap = null;
 let multiSeen = false;
-let drawn = [];             // 描画用の直近ストローク
+let drawn = [];             // 描画用の直近ストローク・タップ
 
 // ダミーのリスト
 const list = document.getElementById('list');
 for (let i = 1; i <= 80; i++) {
   const d = document.createElement('div');
   d.className = 'card';
-  d.innerHTML = `<b>アイテム ${i}</b><small>スクロールして親指の軌跡を集めます</small>`;
+  d.innerHTML = `<b>アイテム ${i}</b><small>スクロールして指の軌跡を集めます</small>`;
   list.appendChild(d);
 }
 const pad = document.getElementById('pad');
@@ -83,55 +168,32 @@ for (let i = 0; i < 8; i++) {
   b.textContent = '●';
   pad.appendChild(b);
 }
+const bars = document.getElementById('bars');
+bars.innerHTML = KEYS.map(k =>
+  `<span>${GRIPS[k].name}</span><div class="track"><i id="bar-${k}" style="background:var(--${k})"></i></div><span class="pct" id="pct-${k}"></span>`
+).join('');
 
-function push(k, s = 0) {
-  events.push({ k, s });
+function push(ll, tap = false) {
+  events.push({ ll, tap });
   if (events.length > WINDOW) events.shift();
   render();
 }
 
-// 縦スワイプ1本からスコアを出す。正 → 右親指、負 → 左親指
-function analyzeSwipe(pts) {
-  const p0 = pts[0], pn = pts[pts.length - 1];
-  const dy = pn.y - p0.y, dx = pn.x - p0.x;
-  if (Math.abs(dy) < SWIPE_MIN_DY || Math.abs(dy) < Math.abs(dx) * 1.5 || pts.length < 5) return null;
-  // 弦（始点→終点）からの x 方向の膨らみ。中間 20〜80% の点だけ使う
-  let sum = 0, n = 0;
-  for (const p of pts) {
-    const t = (p.y - p0.y) / dy;
-    if (t < 0.2 || t > 0.8) continue;
-    sum += p.x - (p0.x + t * dx);
-    n++;
-  }
-  if (!n) return null;
-  const bulge = sum / n / Math.abs(dy);          // 左に膨らむ(負) → 右親指
-  // 上スワイプで右へ流れる / 下スワイプで左へ流れる → 右親指
-  const drift = (dx / Math.abs(dy)) * (dy < 0 ? 1 : -1);
-  return { score: -bulge + 0.3 * drift, bulge, drift };
-}
-
-function verdict() {
-  const c = { R: 0, L: 0, B: 0, S: 0 };
-  for (const e of events) c[e.k]++;
-  const n = events.length;
-  if (n < 3) return { text: '判定中…', color: 'var(--muted)' };
-  if (c.B >= 2) return { text: '両手', color: 'var(--b)' };
-  if (c.R >= n * 0.6) return { text: '右親指', color: 'var(--r)' };
-  if (c.L >= n * 0.6) return { text: '左親指', color: 'var(--l)' };
-  if (c.S >= n * 0.5) return { text: '両手 / 人差し指？', color: 'var(--s)' };
-  return { text: c.R > c.L ? '右親指？' : c.L > c.R ? '左親指？' : '不明', color: 'var(--muted)' };
-}
-
 function render() {
-  const v = verdict();
+  const v = verdict(events);
   const el = document.getElementById('verdict');
   el.textContent = v.text;
   el.style.color = v.color;
-  const sw = events.filter(e => e.k !== 'B');
-  const mean = sw.length ? sw.reduce((a, e) => a + e.s, 0) / sw.length : 0;
-  const pos = Math.max(0, Math.min(1, 0.5 + mean * 5));
-  document.getElementById('needle').style.left = (pos * 100) + '%';
-  document.getElementById('log').innerHTML = events.map(e => `<span class="${e.k}">${e.k}</span>`).join('');
+  const p = posterior(events);
+  for (const k of KEYS) {
+    const pct = Math.round(p[k] * 100);
+    document.getElementById('bar-' + k).style.width = pct + '%';
+    document.getElementById('pct-' + k).textContent = events.length ? pct + '%' : '';
+  }
+  document.getElementById('log').innerHTML = events.map(e => {
+    const k = argmax(e.ll);
+    return `<span class="${e.tap ? 'tap' : ''}" style="background:var(--${k})">${GRIPS[k].short}</span>`;
+  }).join('');
 }
 
 function sub(t) { document.getElementById('sub').textContent = t; }
@@ -139,7 +201,7 @@ function sub(t) { document.getElementById('sub').textContent = t; }
 addEventListener('touchstart', e => {
   if (e.touches.length >= 2 && !multiSeen) {
     multiSeen = true;
-    push('B');
+    push(MULTI_LL);
     sub('同時に2点タッチ → 両手');
   }
   for (const t of e.changedTouches) {
@@ -169,21 +231,27 @@ function end(e) {
     const extra = s.touch.rotationAngle ? ` / 楕円 ${Math.round(s.touch.rotationAngle)}°` : '';
 
     if (dist < 15 && dur < 350) {
-      // タップ：左右の半分を短い間隔で交互に押していれば両手
+      const ll = tapLL(pn.x, pn.y, innerWidth, innerHeight);
+      push(ll, true);
+      drawn.push({ tap: pn, k: argmax(ll), born: performance.now() });
+      // 左右の半分を短い間隔で交互に押していれば両手
       const side = pn.x < innerWidth / 2 ? 'L' : 'R';
       const now = performance.now();
       if (lastTap && lastTap.side !== side && now - lastTap.t < ALT_TAP_MS) {
-        push('B');
+        push(ALT_LL);
         sub(`左右交互タップ ${Math.round(now - lastTap.t)}ms → 両手`);
+      } else {
+        sub(`タップ (${Math.round(pn.x)}, ${Math.round(pn.y)})${extra}`);
       }
       lastTap = { side, t: now };
       continue;
     }
     const r = analyzeSwipe(s.pts);
     if (!r) continue;
-    const k = r.score > VOTE_TH ? 'R' : r.score < -VOTE_TH ? 'L' : 'S';
-    push(k, r.score);
-    sub(`score ${r.score.toFixed(3)}（膨らみ ${r.bulge.toFixed(3)}, 流れ ${r.drift.toFixed(3)}）${extra}`);
+    const ll = swipeLL(r, innerWidth, innerHeight);
+    const k = argmax(ll);
+    push(ll);
+    sub(`score ${r.score.toFixed(3)}（膨らみ ${r.bulge.toFixed(3)}, 流れ ${r.drift.toFixed(3)}）→ ${GRIPS[k].short}${extra}`);
     drawn.push({ pts: s.pts, k, born: performance.now() });
   }
 }
@@ -203,14 +271,19 @@ function resize() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 addEventListener('resize', resize); resize();
-const colors = { R: '#e0603a', L: '#2f7bd8', S: '#9a8f3a' };
+const colors = { R: '#e0603a', L: '#2f7bd8', B: '#3a9a5b', IR: '#b0478f', IL: '#7a5bc9' };
 (function loop() {
   ctx.clearRect(0, 0, innerWidth, innerHeight);
   const now = performance.now();
   drawn = drawn.filter(d => now - d.born < 2000);
   for (const d of drawn) {
     ctx.globalAlpha = 1 - (now - d.born) / 2000;
-    ctx.strokeStyle = colors[d.k]; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.strokeStyle = ctx.fillStyle = colors[d.k];
+    if (d.tap) {
+      ctx.beginPath(); ctx.arc(d.tap.x, d.tap.y, 10, 0, Math.PI * 2); ctx.fill();
+      continue;
+    }
+    ctx.lineWidth = 4; ctx.lineCap = 'round';
     ctx.beginPath();
     d.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
     ctx.stroke();
