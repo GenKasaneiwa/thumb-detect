@@ -68,8 +68,8 @@ const GRIPS = {
 const KEYS = Object.keys(GRIPS);
 const WINDOW = 14;          // 直近いくつの証拠で判定するか
 const SWIPE_MIN_DY = 80;    // 縦スワイプとみなす最小の縦移動(px)
-const ARC_LO = 0.008;       // これ以下の曲がり具合は「まっすぐ」
-const ARC_HI = 0.025;       // これ以上は「はっきり弧」
+const ARC_LO = 0.012;       // これ以下の曲がり具合は「まっすぐ」（実測：人差し指 0.01 前後）
+const ARC_HI = 0.028;       // これ以上は「はっきり弧」（実測：右親指 0.03 前後）
 const ALT_TAP_MS = 280;     // 左右交互タップを両手とみなす間隔
 
 const clamp01 = v => Math.max(0, Math.min(1, v));
